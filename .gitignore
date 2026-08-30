@@ -1,0 +1,62 @@
+# Prerequisites & compiled files
+*.d
+*.slo
+*.lo
+*.o
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.gch
+*.pch
+*.so
+*.dylib
+*.dll
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.app
+
+# Build directories & CMake output
+build/
+build-*/
+build_*/
+cmake-build-*/
+out/
+bin/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.ninja
+.ninja_*
+*.dir/
+
+# IDE & Editor files
+.vscode/
+.idea/
+.vs/
+*.sln
+*.vcxproj*
+*.user
+*.suo
+CMakeSettings.json
+
+# Environment, scratch & reports
+venv/
+__pycache__/
+.cache/
+*.md.bak
+ANTIGRAVITY_REPORT.md
+
+# Solver output files
+*.out
+*.sol
+
+# Bulk datasets, images & results (kept on local disk, excluded from repository)
+results/
+instances/
+imgs/
