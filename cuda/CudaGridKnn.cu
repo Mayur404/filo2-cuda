@@ -220,26 +220,102 @@ __device__ __forceinline__ bool better_candidate(int candidate_id, double candid
     return candidate_id < current_id;
 }
 
+// The per-query scratch row is a binary max heap under the inverse of
+// better_candidate: the root is the *worst* retained candidate.  Keeping the
+// worst element at the root makes the full-heap rejection test O(1), while
+// replacing an accepted root costs only O(log k).  The old implementation
+// kept the row sorted and shifted every element after each accepted point,
+// which made a large-k query quadratic in the number of candidates retained.
+//
+// Scratch is slot-major rather than query-major: slot s for query q is at
+// s * scratch_stride + q.  That makes accesses by neighboring query threads
+// coalesced whenever they inspect the same heap slot and avoids the k-word
+// stride of the former layout.
+__device__ __forceinline__ void sift_down_candidates(int* ids, double* distances,
+                                                      int heap_size, int position,
+                                                      int query_id, int scratch_stride) {
+    while (true) {
+        const long long left_index = 2LL * position + 1;
+        if (left_index >= static_cast<long long>(heap_size)) break;
+        const int left = static_cast<int>(left_index);
+        int child = left;
+        const int right = left + 1;
+        if (right < heap_size &&
+            better_candidate(ids[static_cast<std::size_t>(left) * scratch_stride],
+                             distances[static_cast<std::size_t>(left) * scratch_stride],
+                             ids[static_cast<std::size_t>(right) * scratch_stride],
+                             distances[static_cast<std::size_t>(right) * scratch_stride],
+                             query_id)) {
+            child = right;
+        }
+        // If the current element is no better than the worse child, the heap
+        // property already holds (ties are resolved by vertex ID).
+        const std::size_t position_offset = static_cast<std::size_t>(position) * scratch_stride;
+        const std::size_t child_offset = static_cast<std::size_t>(child) * scratch_stride;
+        if (!better_candidate(ids[position_offset], distances[position_offset], ids[child_offset],
+                              distances[child_offset], query_id)) {
+            break;
+        }
+        const int old_id = ids[position_offset];
+        const double old_distance = distances[position_offset];
+        ids[position_offset] = ids[child_offset];
+        distances[position_offset] = distances[child_offset];
+        ids[child_offset] = old_id;
+        distances[child_offset] = old_distance;
+        position = child;
+    }
+}
+
 __device__ __forceinline__ void insert_candidate(int* ids, double* distances, int* count, int k,
                                                   int candidate_id, double candidate_distance,
-                                                  int query_id) {
-    if (*count == k && !better_candidate(candidate_id, candidate_distance,
-                                          ids[k - 1], distances[k - 1], query_id)) {
+                                                  int query_id, int scratch_stride) {
+    if (*count == k) {
+        // The root is the current worst member.  A candidate that is not
+        // strictly better cannot affect the deterministic top-k result.
+        if (!better_candidate(candidate_id, candidate_distance, ids[0], distances[0], query_id)) {
+            return;
+        }
+
+        // Replace the root and sift the new candidate down until the inverse
+        // ordering is restored.  Select the worse child so it rises toward
+        // the root of this max heap.
+        ids[0] = candidate_id;
+        distances[0] = candidate_distance;
+        sift_down_candidates(ids, distances, k, 0, query_id, scratch_stride);
         return;
     }
-    int position = *count < k ? *count : k - 1;
-    while (position > 0 && better_candidate(candidate_id, candidate_distance,
-                                             ids[position - 1], distances[position - 1], query_id)) {
-        if (position < k) {
-            ids[position] = ids[position - 1];
-            distances[position] = distances[position - 1];
+
+    // There is no need to maintain a heap while it is filling.  Appending the
+    // first k candidates and heapifying once saves the O(log k) sift-up that
+    // would otherwise be paid for every one of those initial candidates.
+    const int position = *count;
+    ++(*count);
+    const std::size_t position_offset = static_cast<std::size_t>(position) * scratch_stride;
+    ids[position_offset] = candidate_id;
+    distances[position_offset] = candidate_distance;
+    if (*count == k) {
+        for (int root = k / 2; root > 0; --root) {
+            sift_down_candidates(ids, distances, k, root - 1, query_id, scratch_stride);
         }
-        --position;
     }
-    if (position < k) {
-        ids[position] = candidate_id;
-        distances[position] = candidate_distance;
-        if (*count < k) ++(*count);
+}
+
+// Convert the worst-first heap to the required best-first row in place.  Each
+// extraction moves the current worst element to the end, so ordinary
+// heap-sort produces ascending (distance, self-first, vertex-ID) order with
+// no second per-query buffer.
+__device__ __forceinline__ void sort_candidates(int* ids, double* distances, int count,
+                                                 int query_id, int scratch_stride) {
+    for (int end = count - 1; end > 0; --end) {
+        const int old_id = ids[0];
+        const double old_distance = distances[0];
+        const std::size_t end_offset = static_cast<std::size_t>(end) * scratch_stride;
+        ids[0] = ids[end_offset];
+        distances[0] = distances[end_offset];
+        ids[end_offset] = old_id;
+        distances[end_offset] = old_distance;
+
+        sift_down_candidates(ids, distances, end, 0, query_id, scratch_stride);
     }
 }
 
@@ -290,14 +366,15 @@ __device__ __forceinline__ double outside_lower_bound(double qx, double qy,
 __device__ __forceinline__ void scan_grid_cell(
         int ix, int iy, int nx, const int* offsets, const int* point_ids,
         const double* xs, const double* ys, double qx, double qy, int query,
-        int k, int* best_ids, double* best_distances, int* count) {
+        int k, int scratch_stride, int* best_ids, double* best_distances, int* count) {
     const int cell = iy * nx + ix;
     for (int position = offsets[cell]; position < offsets[cell + 1]; ++position) {
         const int point = point_ids[position];
         const double distance = point_distance(qx, qy, xs[point], ys[point]);
-        // [CPU-4] Maintain the bounded sorted top-k list after every
-        // candidate, including deterministic ties and self.
-        insert_candidate(best_ids, best_distances, count, k, point, distance, query);
+        // [CPU-4] Maintain a bounded worst-first heap after every candidate,
+        // including deterministic ties and self.
+        insert_candidate(best_ids, best_distances, count, k, point, distance, query,
+                         scratch_stride);
     }
 }
 
@@ -305,7 +382,7 @@ __global__ void grid_knn_kernel(const double* xs, const double* ys, const int* p
                                 const int* offsets, int nx, int ny, double min_x,
                                 double min_y, double cell_size, int n, int k,
                                 int query_offset, int query_count, int* scratch_ids,
-                                double* scratch_distances) {
+                                double* scratch_distances, int scratch_stride) {
     const int local_query = blockIdx.x * blockDim.x + threadIdx.x;
     if (local_query >= query_count) return;
     const int query = query_offset + local_query;
@@ -318,8 +395,10 @@ __global__ void grid_knn_kernel(const double* xs, const double* ys, const int* p
     qix = qix < 0 ? 0 : (qix >= nx ? nx - 1 : qix);
     qiy = qiy < 0 ? 0 : (qiy >= ny ? ny - 1 : qiy);
 
-    int* best_ids = scratch_ids + static_cast<std::size_t>(local_query) * k;
-    double* best_distances = scratch_distances + static_cast<std::size_t>(local_query) * k;
+    // Each heap slot occupies one contiguous batch row.  Offset by the
+    // query lane once, then use scratch_stride in all heap operations.
+    int* best_ids = scratch_ids + local_query;
+    double* best_distances = scratch_distances + local_query;
     int count = 0;
 
     // [CPU-3] Expand the query cell ring by ring.  Each ring visits exactly
@@ -348,25 +427,29 @@ __global__ void grid_knn_kernel(const double* xs, const double* ys, const int* p
         if (raw_low_y >= 0 && raw_low_y < ny) {
             for (int ix = first_x; ix <= last_x; ++ix) {
                 scan_grid_cell(ix, static_cast<int>(raw_low_y), nx, offsets, point_ids,
-                               xs, ys, qx, qy, query, k, best_ids, best_distances, &count);
+                               xs, ys, qx, qy, query, k, scratch_stride, best_ids,
+                               best_distances, &count);
             }
         }
         if (raw_high_y >= 0 && raw_high_y < ny && raw_high_y != raw_low_y) {
             for (int ix = first_x; ix <= last_x; ++ix) {
                 scan_grid_cell(ix, static_cast<int>(raw_high_y), nx, offsets, point_ids,
-                               xs, ys, qx, qy, query, k, best_ids, best_distances, &count);
+                               xs, ys, qx, qy, query, k, scratch_stride, best_ids,
+                               best_distances, &count);
             }
         }
         if (raw_low_x >= 0 && raw_low_x < nx) {
             for (int iy = first_y; iy <= last_y; ++iy) {
                 scan_grid_cell(static_cast<int>(raw_low_x), iy, nx, offsets, point_ids,
-                               xs, ys, qx, qy, query, k, best_ids, best_distances, &count);
+                               xs, ys, qx, qy, query, k, scratch_stride, best_ids,
+                               best_distances, &count);
             }
         }
         if (raw_high_x >= 0 && raw_high_x < nx && raw_high_x != raw_low_x) {
             for (int iy = first_y; iy <= last_y; ++iy) {
                 scan_grid_cell(static_cast<int>(raw_high_x), iy, nx, offsets, point_ids,
-                               xs, ys, qx, qy, query, k, best_ids, best_distances, &count);
+                               xs, ys, qx, qy, query, k, scratch_stride, best_ids,
+                               best_distances, &count);
             }
         }
         if (count == k) {
@@ -374,18 +457,52 @@ __global__ void grid_knn_kernel(const double* xs, const double* ys, const int* p
                                                      nx, ny, min_x, min_y, cell_size);
             // [CPU-5] Strict inequality is intentional: equal-distance unsearched
             // points can win the ID tie-break, so they must still be visited.
-            if (best_distances[k - 1] < lower) break;
+            if (best_distances[0] < lower) break;
         }
     }
 
-    // [CPU-6] Emit the bounded list into the batch scratch row.  The host
-    // copies only IDs for this batch and immediately reuses the same storage.
+    // [CPU-6] Sort the bounded heap into the required best-first order.  The
+    // host copies only IDs for this batch and immediately reuses the storage.
+    sort_candidates(best_ids, best_distances, count, query, scratch_stride);
     for (int position = 0; position < k; ++position) {
         if (position >= count) {
-            best_ids[position] = -1;
+            best_ids[static_cast<std::size_t>(position) * scratch_stride] = -1;
         }
     }
     (void)n;
+}
+
+// Transpose the slot-major heap output to row-major query output.  A 32x32
+// shared-memory tile keeps both global reads from scratch and global writes to
+// output coalesced, including for a final partial query batch.  The distance
+// heap is no longer needed once the query kernel has completed, so this is a
+// separate output buffer rather than an in-place permutation with extra
+// synchronization.
+__global__ void transpose_knn_output_kernel(const int* scratch_ids, int* output_ids,
+                                             int query_count, int k, int scratch_stride) {
+    constexpr int tile_width = 32;
+    constexpr int tile_height = 32;
+    __shared__ int tile[tile_height][tile_width + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int source_query = blockIdx.x * tile_width + tx;
+    const int source_position = blockIdx.y * tile_height + ty;
+    if (source_query < query_count && source_position < k) {
+        tile[ty][tx] = scratch_ids[static_cast<std::size_t>(source_position) *
+                                    static_cast<std::size_t>(scratch_stride) +
+                                    static_cast<std::size_t>(source_query)];
+    }
+    __syncthreads();
+
+    // After the shared-memory transpose, tx indexes the source row and ty
+    // indexes the source column.  The output is [query][rank].
+    const int output_query = blockIdx.x * tile_width + ty;
+    const int output_position = blockIdx.y * tile_height + tx;
+    if (output_query < query_count && output_position < k) {
+        output_ids[static_cast<std::size_t>(output_query) * static_cast<std::size_t>(k) +
+                   static_cast<std::size_t>(output_position)] = tile[tx][ty];
+    }
 }
 
 bool as_size_t(std::uint64_t bytes, std::size_t* result) {
@@ -457,9 +574,10 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
     (void)total_device_bytes;
 
     // No cudaMalloc occurs above this point.  The ledger includes every
-    // allocation made below: x/y coordinates, point IDs, offsets, and both
-    // per-query scratch arrays.  Explicit reserve is removed after applying
-    // min(configured ceiling, cudaMemGetInfo free bytes).
+    // allocation made below: x/y coordinates, point IDs, slot-major heap
+    // scratch, and the row-major transpose output.  Explicit reserve is
+    // removed after applying min(configured ceiling, cudaMemGetInfo free
+    // bytes).
     const std::uint64_t available_before_reserve = std::min(ceiling, free_bytes);
     if (options.memory_reserve_bytes >= available_before_reserve) {
         return make_result(CudaGridKnnStatus::Error,
@@ -467,12 +585,13 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
     }
     const std::uint64_t available = available_before_reserve - options.memory_reserve_bytes;
     const std::uint64_t n = static_cast<std::uint64_t>(n_size);
-    // One thread per query uses global [id,distance] scratch rows.  This maps
-    // the CPU bounded-list steps directly and avoids a warp-wide merge plus
-    // shared memory proportional to k; that traceability is why it was chosen
-    // over a warp-cooperative top-k here.  The representation and the 4096
-    // default batch cap were chosen without empirical verification — benchmark
-    // occupancy, memory traffic, batch size, and k scaling first.
+    // One thread per query uses a bounded [id,distance] heap in slot-major
+    // global scratch.  This preserves independent query traversal while
+    // allowing neighboring query threads to coalesce same-slot accesses.  A
+    // tiled output transpose restores row-major IDs before the host copy.
+    // The 4096 default batch cap bounds launch latency and staging memory;
+    // benchmark occupancy, memory traffic, batch size, and k scaling on the
+    // target GPU before changing it.
     const std::uint64_t batch = max_cuda_batch_for_budget(
         n, effective_k, cells, available, options.max_batch_queries);
     if (batch == 0) {
@@ -490,16 +609,18 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
     std::size_t offsets_bytes = 0;
     std::size_t scratch_ids_bytes = 0;
     std::size_t scratch_dist_bytes = 0;
+    std::size_t output_ids_bytes = 0;
     if (!as_size_t(plan.coordinates_bytes, &coordinates_bytes) ||
         !as_size_t(plan.point_ids_bytes, &ids_bytes) ||
         !as_size_t(plan.offsets_bytes, &offsets_bytes) ||
         !as_size_t(plan.scratch_ids_bytes, &scratch_ids_bytes) ||
-        !as_size_t(plan.scratch_dist_bytes, &scratch_dist_bytes)) {
+        !as_size_t(plan.scratch_dist_bytes, &scratch_dist_bytes) ||
+        !as_size_t(plan.output_ids_bytes, &output_ids_bytes)) {
         return make_result(CudaGridKnnStatus::Error, "CUDA allocation size does not fit size_t");
     }
 
     // The output is intentionally allocated on the host one row at a time in
-    // semantic terms, while device scratch remains only batch*k.  FILO2's
+    // semantic terms, while device staging remains only batch*k.  FILO2's
     // final neighbor list necessarily has N*k host entries; no N*k device
     // output allocation is made here.
     try {
@@ -516,7 +637,9 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
     int* d_offsets = nullptr;
     int* d_scratch_ids = nullptr;
     double* d_scratch_distances = nullptr;
+    int* d_output_ids = nullptr;
     auto release = [&]() {
+        if (d_output_ids != nullptr) cudaFree(d_output_ids);
         if (d_scratch_distances != nullptr) cudaFree(d_scratch_distances);
         if (d_scratch_ids != nullptr) cudaFree(d_scratch_ids);
         if (d_offsets != nullptr) cudaFree(d_offsets);
@@ -553,6 +676,9 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
     allocation_result = allocate(reinterpret_cast<void**>(&d_scratch_distances), scratch_dist_bytes,
                                  "cudaMalloc(d_scratch_distances)");
     if (!allocation_result.succeeded()) return allocation_result;
+    allocation_result = allocate(reinterpret_cast<void**>(&d_output_ids), output_ids_bytes,
+                                 "cudaMalloc(d_output_ids)");
+    if (!allocation_result.succeeded()) return allocation_result;
 
     auto copy_to_device = [&](void* destination, const void* source, std::size_t bytes,
                               const char* name) -> CudaGridKnnResult {
@@ -588,24 +714,39 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
         const std::uint64_t query_count_u64 = std::min(batch, n - query_offset);
         const int query_offset_i = static_cast<int>(query_offset);
         const int query_count = static_cast<int>(query_count_u64);
-        const int blocks = (query_count + kThreadsPerBlock - 1) / kThreadsPerBlock;
+        const int blocks =
+            static_cast<int>((query_count_u64 + kThreadsPerBlock - 1ULL) /
+                             static_cast<std::uint64_t>(kThreadsPerBlock));
         grid_knn_kernel<<<blocks, kThreadsPerBlock>>>(
             d_x, d_y, d_point_ids, d_offsets, grid.nx, grid.ny, grid.min_x, grid.min_y,
             grid.cell_size, static_cast<int>(n), static_cast<int>(effective_k), query_offset_i,
-            query_count, d_scratch_ids, d_scratch_distances);
+            query_count, d_scratch_ids, d_scratch_distances, static_cast<int>(batch));
         cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) {
             release();
             return make_result(CudaGridKnnStatus::Error, cuda_error("grid_knn_kernel launch", error));
         }
-        error = cudaDeviceSynchronize();
+
+        const int transpose_blocks_x =
+            static_cast<int>((query_count_u64 + 31ULL) / 32ULL);
+        const int transpose_blocks_y =
+            static_cast<int>((effective_k + 31ULL) / 32ULL);
+        transpose_knn_output_kernel<<<dim3(transpose_blocks_x, transpose_blocks_y),
+                                      dim3(32, 32)>>>(
+            d_scratch_ids, d_output_ids, query_count, static_cast<int>(effective_k),
+            static_cast<int>(batch));
+        error = cudaGetLastError();
         if (error != cudaSuccess) {
             release();
-            return make_result(CudaGridKnnStatus::Error, cuda_error("grid_knn_kernel execution", error));
+            return make_result(CudaGridKnnStatus::Error,
+                               cuda_error("transpose_knn_output_kernel launch", error));
         }
         const std::size_t copied_ids = static_cast<std::size_t>(query_count_u64) *
                                        static_cast<std::size_t>(effective_k);
-        error = cudaMemcpy(batch_ids.data(), d_scratch_ids,
+        // This blocking D2H copy is the stream-completion boundary for both
+        // kernels; an explicit cudaDeviceSynchronize would only duplicate
+        // this wait and add a host round trip per batch.
+        error = cudaMemcpy(batch_ids.data(), d_output_ids,
                            copied_ids * sizeof(int), cudaMemcpyDeviceToHost);
         if (error != cudaSuccess) {
             release();
@@ -613,9 +754,9 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
         }
         for (std::size_t local = 0; local < static_cast<std::size_t>(query_count); ++local) {
             const std::size_t query = static_cast<std::size_t>(query_offset) + local;
-            for (std::size_t position = 0; position < static_cast<std::size_t>(effective_k); ++position) {
-                out[query][position] = batch_ids[local * static_cast<std::size_t>(effective_k) + position];
-            }
+            const int* source = batch_ids.data() +
+                                local * static_cast<std::size_t>(effective_k);
+            std::copy_n(source, static_cast<std::size_t>(effective_k), out[query].data());
         }
     }
     release();

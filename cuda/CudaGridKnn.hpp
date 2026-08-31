@@ -29,9 +29,9 @@ struct CudaGridKnnOptions {
     double cell_size = 0.0;
 
     // The worker uses one CUDA thread per query and a bounded [id,distance]
-    // scratch row for that query.  A 4096-query cap bounds launch latency and
-    // host staging while still exposing many blocks.  That value was chosen
-    // without empirical verification — benchmark batch size first.
+    // max-heap in slot-major batch scratch.  A 4096-query cap bounds launch
+    // latency and host staging while still exposing many blocks.  That value
+    // was chosen without empirical verification — benchmark batch size first.
     std::uint64_t max_batch_queries = 4096;
 
     // Eight GiB is the default ceiling, independently of total device RAM.

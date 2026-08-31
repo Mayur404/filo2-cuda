@@ -183,6 +183,18 @@ if(BUILD_TESTING)
     target_include_directories(cuda_memory_plan_test
         PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME cuda_memory_plan_test COMMAND cuda_memory_plan_test)
+
+    # Direct head-to-head test: base/KDTree.cpp vs knn/GridKnn.cpp
+    add_executable(kdtree_vs_gridknn_test
+        tests/kdtree_vs_gridknn_test.cpp
+        base/KDTree.cpp
+        base/KDTree.hpp
+        ${FILO2_KNN_SOURCES}
+    )
+    target_compile_features(kdtree_vs_gridknn_test PRIVATE cxx_std_17)
+    target_include_directories(kdtree_vs_gridknn_test
+        PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME kdtree_vs_gridknn_test COMMAND kdtree_vs_gridknn_test)
 endif()
 
 if(BUILD_TESTING AND FILO2_USE_CUDA)
