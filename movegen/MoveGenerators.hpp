@@ -166,6 +166,13 @@ namespace cobra {
             const int neighbors_begin = 1;
             const int neighbors_end = neighbors_begin + max_num_neighbors;
 
+            const size_t estimated_moves = static_cast<size_t>(instance.get_vertices_num()) * max_num_neighbors;
+            moves.reserve(std::min<size_t>(estimated_moves * 2, 35000000ULL));
+            edge_costs.reserve(std::min<size_t>(estimated_moves, 17500000ULL));
+            for (int i = instance.get_vertices_begin(); i < instance.get_vertices_end(); ++i) {
+                base_move_indices_involving[i].reserve(max_num_neighbors + 2);
+            }
+
             for (int i = instance.get_vertices_begin(); i < instance.get_vertices_end(); ++i) {
                 const auto& ineighbors = instance.get_neighbors_of(i);
 

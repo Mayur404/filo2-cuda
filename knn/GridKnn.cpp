@@ -42,9 +42,18 @@ struct WorseFirst {
     }
 };
 
-using CandidateHeap = std::priority_queue<Candidate,
-                                          std::vector<Candidate>,
-                                          WorseFirst>;
+class CandidateHeap : public std::priority_queue<Candidate,
+                                                   std::vector<Candidate>,
+                                                   WorseFirst> {
+    using Base = std::priority_queue<Candidate, std::vector<Candidate>, WorseFirst>;
+
+public:
+    using Base::Base;
+
+    void exchange_storage(std::vector<Candidate>& reusable) {
+        this->c.swap(reusable);
+    }
+};
 
 Wide SquaredDistance(const Point2D& a, const Point2D& b) {
     const Wide dx = static_cast<Wide>(a.x) - static_cast<Wide>(b.x);
@@ -127,12 +136,27 @@ public:
         if (nx_ > std::numeric_limits<std::size_t>::max() / ny_) {
             throw std::length_error("GridKnn grid cell count overflows size_t");
         }
-        cells_.resize(nx_ * ny_);
-
+        const std::size_t total_cells = nx_ * ny_;
+        if (total_cells > std::numeric_limits<std::size_t>::max() - 1) {
+            throw std::length_error("GridKnn grid cell count overflows size_t");
+        }
+        offsets_.assign(total_cells + 1, 0);
+        std::vector<std::size_t> cell_ids(points_.size());
         for (std::size_t i = 0; i < points_.size(); ++i) {
             const std::size_t cx = CellX(points_[i].x);
             const std::size_t cy = CellY(points_[i].y);
-            cells_[FlatIndex(cx, cy)].push_back(static_cast<int>(i));
+            const std::size_t cell = FlatIndex(cx, cy);
+            cell_ids[i] = cell;
+            ++offsets_[cell + 1];
+        }
+        for (std::size_t cell = 1; cell < offsets_.size(); ++cell) {
+            offsets_[cell] += offsets_[cell - 1];
+        }
+        point_ids_.resize(points_.size());
+        std::vector<std::size_t> write_positions(offsets_.begin(), offsets_.end() - 1);
+        for (std::size_t i = 0; i < points_.size(); ++i) {
+            const std::size_t cell = cell_ids[i];
+            point_ids_[write_positions[cell]++] = static_cast<int>(i);
         }
     }
 
@@ -147,8 +171,16 @@ public:
     const Bounds& bounds() const { return bounds_; }
     Wide cell_size() const { return cell_size_; }
 
-    const std::vector<int>& cell(std::size_t cx, std::size_t cy) const {
-        return cells_[FlatIndex(cx, cy)];
+    std::size_t cell_begin(std::size_t cx, std::size_t cy) const {
+        return offsets_[FlatIndex(cx, cy)];
+    }
+
+    std::size_t cell_end(std::size_t cx, std::size_t cy) const {
+        return offsets_[FlatIndex(cx, cy) + 1];
+    }
+
+    int point_id(std::size_t position) const {
+        return point_ids_[position];
     }
 
     std::size_t CellX(double x) const {
@@ -219,7 +251,10 @@ public:
         else if (qx > x1) dx = qx - x1;
         if (qy < y0) dy = y0 - qy;
         else if (qy > y1) dy = qy - y1;
-        return dx * dx + dy * dy;
+        // Keep the bound conservative across the rounded cell-boundary
+        // arithmetic. Equality must remain searchable because the final
+        // vertex-ID tie-break is part of the exact result.
+        return std::nextafter(dx * dx + dy * dy, static_cast<Wide>(0));
     }
 
 private:
@@ -256,7 +291,8 @@ private:
     std::size_t target_axis_ = 0;
     std::size_t nx_ = 0;
     std::size_t ny_ = 0;
-    std::vector<std::vector<int>> cells_;
+    std::vector<int> point_ids_;
+    std::vector<std::size_t> offsets_;
 };
 
 NeighborLists MakeCoordinatePoints(const std::vector<double>& xcoords,
@@ -319,12 +355,20 @@ NeighborLists GridKnn(const std::vector<Point2D>& points, int k) {
     if (effective_k == 0 || points.empty()) return result;
 
     UniformGrid grid(points);
+    // Queries are independent, but each bounded heap has the same maximum
+    // size. Exchange one reusable backing vector instead of allocating and
+    // freeing a k-sized heap buffer for every point in the fallback path.
+    std::vector<Candidate> reusable_heap_storage;
+    reusable_heap_storage.reserve(static_cast<std::size_t>(effective_k));
+    std::vector<Candidate> ordered;
+    ordered.reserve(static_cast<std::size_t>(effective_k));
 
     for (std::size_t query_index = 0; query_index < points.size(); ++query_index) {
         // [CPU-2] Query/top-k initialization.  The heap is bounded throughout
         // the search; once full, top() is the exact current worst candidate.
         const int query_id = static_cast<int>(query_index);
         CandidateHeap heap(WorseFirst{query_id});
+        heap.exchange_storage(reusable_heap_storage);
         const std::size_t query_cx = grid.CellX(points[query_index].x);
         const std::size_t query_cy = grid.CellY(points[query_index].y);
         const std::size_t final_ring = grid.max_ring(query_cx, query_cy);
@@ -335,7 +379,9 @@ NeighborLists GridKnn(const std::vector<Point2D>& points, int k) {
             // because every nonempty cell has one Chebyshev ring number.
             grid.ForEachRing(query_cx, query_cy, radius,
                              [&](std::size_t cx, std::size_t cy) {
-                                 for (int candidate_id : grid.cell(cx, cy)) {
+                                 for (std::size_t position = grid.cell_begin(cx, cy);
+                                      position < grid.cell_end(cx, cy); ++position) {
+                                     const int candidate_id = grid.point_id(position);
                                      // [CPU-4] Bounded candidate update.
                                      const Candidate candidate{
                                          candidate_id,
@@ -378,7 +424,7 @@ NeighborLists GridKnn(const std::vector<Point2D>& points, int k) {
         // [CPU-6] Ordered output.  priority_queue order is intentionally not
         // exposed: sorting establishes the same deterministic order as the
         // brute-force reference regardless of ring/cell insertion order.
-        std::vector<Candidate> ordered;
+        ordered.clear();
         ordered.reserve(heap.size());
         while (!heap.empty()) {
             ordered.push_back(heap.top());
@@ -392,6 +438,10 @@ NeighborLists GridKnn(const std::vector<Point2D>& points, int k) {
         for (const Candidate& candidate : ordered) {
             result[query_index].push_back(candidate.index);
         }
+
+        // The heap is empty after the drain; return its capacity to the
+        // reusable vector before the next query constructs its comparator.
+        heap.exchange_storage(reusable_heap_storage);
     }
     return result;
 }

@@ -5,8 +5,10 @@
 #include <cmath>
 #include <optional>
 #include <string>
+#include <vector>
 
-#include "../base/NonCopyable.hpp"
+#include "base/NonCopyable.hpp"
+#include "InstanceData.hpp"
 #include "Parser.hpp"
 
 namespace cobra {
@@ -22,7 +24,14 @@ namespace cobra {
         // Returns an optional containing a properly built instance if the parsing of the input file completes correctly, nullopt otherwise.
         // The parameter `num_neighbors` specifies the number of neighbors that are precomputed for each vertice. These neighbors are then
         // accessibly by using the `get_neighbors_of` method.
-        static std::optional<Instance> make(const std::string& filepath, int num_neighbors);
+        static std::optional<Instance> make(const std::string& filepath, int num_neighbors, int threads_num = 1,
+                                            const std::vector<std::vector<int>>& neighbors_ = std::vector<std::vector<int>>());
+
+        // Creates an instance from the given instance data.
+        static Instance make(const InstanceData& data, int num_neighbors, int threads_num = 1,
+                             const std::vector<std::vector<int>>& neighbors_ = std::vector<std::vector<int>>());
+        static Instance make(InstanceData&& data, int num_neighbors, int threads_num = 1,
+                             const std::vector<std::vector<int>>& neighbors_ = std::vector<std::vector<int>>());
 
         // Returns the instance size.
         inline int get_vertices_num() const {
@@ -69,11 +78,19 @@ namespace cobra {
             assert(i >= get_vertices_begin() && i < get_vertices_end());
             assert(j >= get_vertices_begin() && j < get_vertices_end());
 
+            if (i == get_depot()) return depot_costs[j];
+            if (j == get_depot()) return depot_costs[i];
+
             const double sqrt = std::sqrt((xcoords[i] - xcoords[j]) * (xcoords[i] - xcoords[j]) +
                                           (ycoords[i] - ycoords[j]) * (ycoords[i] - ycoords[j]));
             assert(static_cast<int>(std::round(sqrt)) == static_cast<int>(fastround(sqrt)));
 
             return fastround(sqrt);
+        }
+
+        inline double get_cost_to_depot(int i) const {
+            assert(i >= get_vertices_begin() && i < get_vertices_end());
+            return depot_costs[i];
         }
 
         // Returns the demand of vertex `i`. The demand is 0 for the depot.
@@ -98,7 +115,8 @@ namespace cobra {
         };
 
     private:
-        Instance(const Parser::Data& data, int neighbors_num);
+        Instance(InstanceData data, int neighbors_num, int threads_num = 1,
+                 const std::vector<std::vector<int>>& neighbors_ = std::vector<std::vector<int>>());
 
         // Maximum vehicle capacity.
         int vehicle_capacity;
@@ -111,6 +129,9 @@ namespace cobra {
 
         // Vertices demands.
         std::vector<int> demands;
+
+        // Rounded depot-to-vertex costs.
+        std::vector<double> depot_costs;
 
         // Neighbors for each vertex.
         std::vector<std::vector<int>> neighbors;

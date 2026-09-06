@@ -3,35 +3,25 @@
 
 #include <optional>
 #include <string>
-#include <vector>
 
-#include "../base/NonCopyable.hpp"
+#include "base/NonCopyable.hpp"
+#include "InstanceData.hpp"
 
 namespace cobra {
 
     // Very simple TSPLIB-like parser specialized to parse X-like instances.
     class Parser : private NonCopyable<Parser> {
     public:
+        using Data = InstanceData;
+
         Parser(const std::string& filepath);
 
-        // Parsed data.
-        struct Data : private NonCopyable<Data> {
-            // Maximum vehicle capacity.
-            int vehicle_capacity;
-            // Vertices x coordinates.
-            std::vector<double> xcoords;
-            // Vertices y coordinates.
-            std::vector<double> ycoords;
-            // Vertices demands.
-            std::vector<int> demands;
-        };
-
         // Parses the instance and returns the parsed data if successful, nullopt otherwise.
-        std::optional<Data> Parse();
+        std::optional<InstanceData> Parse();
 
     private:
         // Instance file path.
-        const std::string& filepath;
+        const std::string filepath;
     };
 
 }  // namespace cobra

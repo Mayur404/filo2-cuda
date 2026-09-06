@@ -30,25 +30,27 @@ namespace cobra {
         auto savings = std::vector<Saving>();
         savings.reserve(static_cast<unsigned long>(savings_num));
 
+        const int depot = instance.get_depot();
+        std::vector<double> depot_costs(instance.get_vertices_num());
+        for (int i = instance.get_customers_begin(); i < instance.get_customers_end(); ++i) {
+            depot_costs[i] = instance.get_cost(i, depot);
+        }
+
         for (auto i = instance.get_customers_begin(); i < instance.get_customers_end(); i++) {
+            const double cost_i_depot = depot_costs[i];
+            const auto &ineighbors = instance.get_neighbors_of(i);
+            const unsigned int max_n = static_cast<unsigned int>(ineighbors.size());
 
-            for (auto n = 1u, added = 0u; added < static_cast<unsigned int>(neighbors_num) && n < instance.get_neighbors_of(i).size();
-                 n++) {
-
-                const auto j = instance.get_neighbors_of(i)[n];
+            for (auto n = 1u, added = 0u; added < static_cast<unsigned int>(neighbors_num) && n < max_n; n++) {
+                const auto j = ineighbors[n];
 
                 if (i < j) {
-
-                    const double value = +instance.get_cost(i, instance.get_depot()) + instance.get_cost(instance.get_depot(), j) -
-                                         lambda * instance.get_cost(i, j);
-
+                    const double value = cost_i_depot + depot_costs[j] - lambda * instance.get_cost(i, j);
                     savings.push_back({i, j, value});
-
                     added++;
                 }
             }
         }
-
 
         std::sort(savings.begin(), savings.end(), [](const Saving &a, const Saving &b) { return a.value > b.value; });
 

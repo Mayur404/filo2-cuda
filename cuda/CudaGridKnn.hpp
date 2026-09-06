@@ -32,7 +32,7 @@ struct CudaGridKnnOptions {
     // max-heap in slot-major batch scratch.  A 4096-query cap bounds launch
     // latency and host staging while still exposing many blocks.  That value
     // was chosen without empirical verification — benchmark batch size first.
-    std::uint64_t max_batch_queries = 4096;
+    std::uint64_t max_batch_queries = 32768;
 
     // Eight GiB is the default ceiling, independently of total device RAM.
     // FILO2_CUDA_MEMORY_CEILING_MB, when set, overrides this value in MiB.
@@ -41,6 +41,12 @@ struct CudaGridKnnOptions {
     // Keep this explicit reserve out of the allocation budget so driver and
     // unrelated application allocations do not consume the last bytes.
     std::uint64_t memory_reserve_bytes = 256ULL * 1024ULL * 1024ULL;
+
+    // Target average occupancy of a non-empty spatial cell.  Using a little
+    // more than one point per cell greatly reduces empty-ring traversal for
+    // large k while retaining a cheap conservative grid lower bound.  This
+    // field is last to preserve aggregate initialization of older options.
+    double target_cell_occupancy = 8.0;
 };
 
 // Builds a compact host grid, processes query points in GPU batches, and

@@ -6,33 +6,66 @@
 
 #include "../instance/Instance.hpp"
 
-
 namespace bpp {
 
-    // Simple greedy solution of the bin packing problem associated with the CVRP instance.
+    // Fast O(N log K) greedy first-fit decreasing bin packing using a segment tree.
     inline int greedy_first_fit_decreasing(const cobra::Instance& instance) {
+        const int n = instance.get_customers_num();
+        if (n == 0) return 0;
 
-        std::vector<int> customers(instance.get_customers_num());
-        for (auto i = instance.get_customers_begin(); i < instance.get_customers_end(); i++) {
-            customers[i - 1] = i;
+        std::vector<int> customers(n);
+        for (int i = 0; i < n; ++i) {
+            customers[i] = instance.get_customers_begin() + i;
         }
 
         std::sort(customers.begin(), customers.end(),
-                  [&instance](auto i, auto j) { return instance.get_demand(i) > instance.get_demand(j); });
+                  [&instance](int i, int j) { return instance.get_demand(i) > instance.get_demand(j); });
 
-        std::vector<int> bins(instance.get_customers_num(), 0);
+        const int capacity = instance.get_vehicle_capacity();
+
+        // Build a segment tree over at most n bins, tracking max remaining capacity in each subtree.
+        int tree_size = 1;
+        while (tree_size < n) {
+            tree_size <<= 1;
+        }
+
+        std::vector<int> tree(2 * tree_size, 0);
+        for (int i = 0; i < n; ++i) {
+            tree[tree_size + i] = capacity;
+        }
+        for (int i = tree_size - 1; i > 0; --i) {
+            tree[i] = std::max(tree[2 * i], tree[2 * i + 1]);
+        }
 
         int used_bins = 0;
-        for (auto i : customers) {
-            const int demand = instance.get_demand(i);
-            for (int p = 0; p < static_cast<int>(bins.size()); p++) {
-                if (bins[p] + demand <= instance.get_vehicle_capacity()) {
-                    bins[p] += demand;
-                    if (p + 1 > used_bins) {
-                        used_bins = p + 1;
-                    }
-                    break;
+        for (int c : customers) {
+            const int demand = instance.get_demand(c);
+            int node = 1;
+            int l = 0;
+            int r = tree_size - 1;
+
+            while (l < r) {
+                const int mid = (l + r) / 2;
+                if (tree[2 * node] >= demand) {
+                    node = 2 * node;
+                    r = mid;
+                } else {
+                    node = 2 * node + 1;
+                    l = mid + 1;
                 }
+            }
+
+            tree[node] -= demand;
+            const int bin_idx = l;
+            if (bin_idx + 1 > used_bins) {
+                used_bins = bin_idx + 1;
+            }
+
+            // Push update back up to the root.
+            node >>= 1;
+            while (node > 0) {
+                tree[node] = std::max(tree[2 * node], tree[2 * node + 1]);
+                node >>= 1;
             }
         }
 
@@ -41,5 +74,4 @@ namespace bpp {
 
 }  // namespace bpp
 
-
-#endif
+#endif

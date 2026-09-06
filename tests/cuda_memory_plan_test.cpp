@@ -25,16 +25,13 @@ int main() {
     require(one.offsets_bytes == 1025ULL * sizeof(int), "offset ledger mismatch");
     require(one.scratch_ids_bytes == 25ULL * sizeof(int), "scratch-ID ledger mismatch");
     require(one.scratch_dist_bytes == 25ULL * sizeof(double), "scratch-distance ledger mismatch");
-    require(one.output_ids_bytes == 25ULL * sizeof(int), "output-ID ledger mismatch");
     require(one.total_bytes == one.coordinates_bytes + one.point_ids_bytes + one.offsets_bytes +
-                                   one.scratch_ids_bytes + one.scratch_dist_bytes +
-                                   one.output_ids_bytes,
+                                   one.scratch_ids_bytes + one.scratch_dist_bytes,
             "total ledger mismatch");
 
     const std::uint64_t static_bytes = one.total_bytes - one.scratch_ids_bytes -
-                                       one.scratch_dist_bytes - one.output_ids_bytes;
-    const std::uint64_t per_query = one.scratch_ids_bytes + one.scratch_dist_bytes +
-                                    one.output_ids_bytes;
+                                       one.scratch_dist_bytes;
+    const std::uint64_t per_query = one.scratch_ids_bytes + one.scratch_dist_bytes;
     // Exactly two rows fit below this boundary; a third row is one byte too large.
     const std::uint64_t boundary_budget = static_bytes + 2ULL * per_query;
     require(max_cuda_batch_for_budget(1000, 25, 1024, boundary_budget, 1000) == 2,

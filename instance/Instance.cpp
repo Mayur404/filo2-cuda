@@ -1,37 +1,48 @@
 #include "Instance.hpp"
 
 #include <algorithm>
+#include <iostream>
+#include <utility>
 
-#include "../base/KDTree.hpp"
-#include "../base/Timer.hpp"
+#include "base/KDTree.hpp"
+#include "base/Timer.hpp"
 
 #ifdef FILO2_USE_CUDA
-    #include "../cuda/CudaGridKnn.hpp"
-    #include <iostream>
-#endif
-
-#ifdef VERBOSE
-    #include <iostream>
+    #include "cuda/CudaGridKnn.hpp"
 #endif
 
 namespace cobra {
 
     // static
-    std::optional<Instance> Instance::make(const std::string& filepath, int neighbors_num) {
+    std::optional<Instance> Instance::make(const std::string& filepath, int neighbors_num, int threads_num,
+                                           const std::vector<std::vector<int>>& neighbors_) {
 
         Parser parser(filepath);
 
-        std::optional<Parser::Data> maybe_data = parser.Parse();
+        std::optional<InstanceData> maybe_data = parser.Parse();
         if (!maybe_data.has_value()) {
             return std::nullopt;
         }
 
-        return Instance(maybe_data.value(), neighbors_num);
+        return Instance(std::move(maybe_data.value()), neighbors_num, threads_num, neighbors_);
     }
 
-    Instance::Instance(const Parser::Data& data, int neighbors_num) {
+    // static
+    Instance Instance::make(const InstanceData& data, int num_neighbors, int threads_num,
+                            const std::vector<std::vector<int>>& neighbors_) {
+        return Instance(data, num_neighbors, threads_num, neighbors_);
+    }
 
-        neighbors_num = std::min(neighbors_num, static_cast<int>(data.demands.size()));
+    // static
+    Instance Instance::make(InstanceData&& data, int num_neighbors, int threads_num,
+                            const std::vector<std::vector<int>>& neighbors_) {
+        return Instance(std::move(data), num_neighbors, threads_num, neighbors_);
+    }
+
+    Instance::Instance(InstanceData data, int neighbors_num, int threads_num,
+                       const std::vector<std::vector<int>>& neighbors_) {
+
+        neighbors_num = std::max(0, std::min(neighbors_num, static_cast<int>(data.demands.size())));
 
         // Copy info from parsed data.
         vehicle_capacity = data.vehicle_capacity;
@@ -39,7 +50,28 @@ namespace cobra {
         ycoords = std::move(data.ycoords);
         demands = std::move(data.demands);
 
-        // Identify the neighbors of each vertex by using a K-d tree, see again the paper cited above.
+        // Cache the depot distance row that is repeatedly queried by
+        // initial construction, savings, routemin, and ruin-and-recreate.
+        depot_costs.resize(xcoords.size());
+        if (!xcoords.empty()) {
+            for (std::size_t i = 0; i < xcoords.size(); ++i) {
+                const double dx = xcoords[i] - xcoords[get_depot()];
+                const double dy = ycoords[i] - ycoords[get_depot()];
+                depot_costs[i] = fastround(std::sqrt(dx * dx + dy * dy));
+            }
+        }
+
+        if (!neighbors_.empty()) {
+            assert(static_cast<int>(neighbors_.size()) == get_vertices_num());
+#ifndef NDEBUG
+            for (int i = get_vertices_begin(); i < get_vertices_end(); ++i) {
+                assert(!neighbors_[i].empty());
+            }
+#endif
+            neighbors = neighbors_;
+            return;
+        }
+
         neighbors.resize(get_vertices_num());
 
 #ifdef FILO2_USE_CUDA
@@ -47,18 +79,19 @@ namespace cobra {
         // existing neighbor lists: one vector per vertex, sorted by the
         // coordinate distance, with the query vertex in position zero.  A
         // CUDA build is still allowed to run on a CPU-only host: the API
-        // reports NoDevice (or Error), and the original kd-tree code below
+        // reports NoDevice (or Error), and the OpenMP kd-tree code below
         // remains the authoritative fallback.
         std::vector<std::vector<int>> cuda_neighbors;
         const auto cuda_result = filo2_cuda::compute_cuda_grid_knn(
             xcoords, ycoords, neighbors_num, cuda_neighbors);
         bool cuda_shape_is_valid =
             cuda_neighbors.size() == static_cast<std::size_t>(get_vertices_num());
-        if (cuda_shape_is_valid) {
-            for (int i = get_vertices_begin(); i < get_vertices_end(); ++i) {
-                const auto& row = cuda_neighbors[static_cast<std::size_t>(i)];
-                if (row.size() != static_cast<std::size_t>(neighbors_num) ||
-                    (neighbors_num > 0 && row.front() != i)) {
+        if (cuda_shape_is_valid && get_vertices_num() > 0) {
+            const std::size_t n = static_cast<std::size_t>(get_vertices_num());
+            const std::size_t samples[] = {0, n / 4, n / 2, 3 * n / 4, n - 1};
+            for (std::size_t s : samples) {
+                if (cuda_neighbors[s].size() != static_cast<std::size_t>(neighbors_num) ||
+                    (neighbors_num > 0 && cuda_neighbors[s].front() != static_cast<int>(s))) {
                     cuda_shape_is_valid = false;
                     break;
                 }
@@ -70,45 +103,36 @@ namespace cobra {
         }
 
         std::cerr << "WARNING: CUDA neighbor-list preprocessing unavailable; "
-                     "falling back to the original CPU kd-tree path";
+                     "falling back to CPU kd-tree path";
         if (!cuda_result.message.empty()) {
             std::cerr << " (" << cuda_result.message << ")";
         }
         std::cerr << ".\n";
 #endif
 
+        auto set_first_neighbor = [&](const int i) {
+            if (neighbors[i][0] != i) {
+                const auto self = std::find(neighbors[i].begin() + 1, neighbors[i].end(), i);
+                if (self == neighbors[i].end()) {
+                    neighbors[i].back() = i;
+                    std::swap(neighbors[i].front(), neighbors[i].back());
+                } else {
+                    std::iter_swap(neighbors[i].begin(), self);
+                }
+            }
+        };
+
         KDTree kd_tree(xcoords, ycoords);
 
-#ifdef VERBOSE
-        Timer timer;
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static) num_threads(threads_num)
 #endif
-
         for (int i = get_vertices_begin(); i < get_vertices_end(); ++i) {
-
             neighbors[i] = kd_tree.GetNearestNeighbors(xcoords[i], ycoords[i], neighbors_num);
-
-            // Make sure the first vertex is `i`. Since we are not using all neighbors, if several vertices overlap and the number of
-            // neighbors is not large enough we might not have `i` in the neighbors set. Let's cross the fingers and hope it does not
-            // happen.
-            if (neighbors[i][0] != i) {
-                auto n = 1;
-                while (n < static_cast<int>(neighbors[i].size())) {
-                    if (neighbors[i][n] == i) {
-                        break;
-                    }
-                    n++;
-                }
-                std::swap(neighbors[i][0], neighbors[i][n]);
+            if (neighbors_num > 0) {
+                set_first_neighbor(i);
+                assert(neighbors[i][0] == i);
             }
-
-            assert(neighbors[i][0] == i);
-
-#ifdef VERBOSE
-            if (timer.elapsed_time<std::chrono::seconds>() > 10) {
-                std::cout << "Progress: " << 100 * (i + 1) / get_vertices_num() << "%\n";
-                timer.reset();
-            }
-#endif
         }
     }
 
