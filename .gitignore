@@ -58,5 +58,6 @@ ANTIGRAVITY_REPORT.md
 
 # Bulk datasets, images & results (kept on local disk, excluded from repository)
 results/
+benchmark-results/
 instances/
 imgs/

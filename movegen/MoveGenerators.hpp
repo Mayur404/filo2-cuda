@@ -166,6 +166,18 @@ namespace cobra {
             const int neighbors_begin = 1;
             const int neighbors_end = neighbors_begin + max_num_neighbors;
 
+            // The cutoff for a vertex is queried by every reverse candidate.
+            // Compute it once instead of repeating the same distance and
+            // square root for each of those candidates.
+            std::vector<double> cutoff_costs(instance.get_vertices_num());
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static) if(instance.get_vertices_num() >= 10000)
+#endif
+            for (int i = instance.get_vertices_begin(); i < instance.get_vertices_end(); ++i) {
+                const auto& neighbors = instance.get_neighbors_of(i);
+                cutoff_costs[i] = instance.get_cost(i, neighbors[neighbors_end - 1]);
+            }
+
             const size_t estimated_moves = static_cast<size_t>(instance.get_vertices_num()) * max_num_neighbors;
             moves.reserve(std::min<size_t>(estimated_moves * 2, 35000000ULL));
             edge_costs.reserve(std::min<size_t>(estimated_moves, 17500000ULL));
@@ -203,8 +215,8 @@ namespace cobra {
 
                     const auto& jneighbors = instance.get_neighbors_of(j);
 
-                    const double cij = instance.get_cost(i, j);
-                    const double cjn = instance.get_cost(j, jneighbors[neighbors_end - 1]);
+                    const double cij = cost;
+                    const double cjn = cutoff_costs[j];
                     if (cij > cjn) {
                         insert(j, i);
                         continue;

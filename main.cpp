@@ -14,6 +14,10 @@
 #include "solution/Solution.hpp"
 #include "solution/savings.hpp"
 
+#ifdef _OPENMP
+    #include <omp.h>
+#endif
+
 #ifdef GUI
     #include "Renderer.hpp"
 #endif
@@ -44,7 +48,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Pre-processing the instance.\n";
     timer.reset();
 #endif
-    std::optional<cobra::Instance> maybe_instance = cobra::Instance::make(params.get_instance_path(), params.get_neighbors_num());
+    int preprocessing_threads = 1;
+#ifdef _OPENMP
+    preprocessing_threads = omp_get_max_threads();
+#endif
+    std::optional<cobra::Instance> maybe_instance =
+        cobra::Instance::make(params.get_instance_path(), params.get_neighbors_num(), preprocessing_threads);
 #ifdef VERBOSE
     std::cout << "Done in " << timer.elapsed_time<std::chrono::seconds>() << " seconds.\n\n";
 #endif

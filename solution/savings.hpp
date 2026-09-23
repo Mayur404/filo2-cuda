@@ -4,7 +4,6 @@
 #include "../base/Timer.hpp"
 #include "Solution.hpp"
 
-
 namespace cobra {
 
     // Limited savings algorithm.
@@ -19,8 +18,6 @@ namespace cobra {
 
         neighbors_num = std::min(instance.get_customers_num() - 1, neighbors_num);
 
-        const auto savings_num = instance.get_customers_num() * neighbors_num;
-
         struct Saving {
             int i;
             int j;
@@ -28,7 +25,6 @@ namespace cobra {
         };
 
         auto savings = std::vector<Saving>();
-        savings.reserve(static_cast<unsigned long>(savings_num));
 
         const int depot = instance.get_depot();
         std::vector<double> depot_costs(instance.get_vertices_num());
@@ -36,29 +32,52 @@ namespace cobra {
             depot_costs[i] = instance.get_cost(i, depot);
         }
 
-        for (auto i = instance.get_customers_begin(); i < instance.get_customers_end(); i++) {
-            const double cost_i_depot = depot_costs[i];
+        // Each customer owns a disjoint output range. Count first so workers
+        // can fill those ranges without locks or concurrent vector growth.
+        const int first = instance.get_customers_begin();
+        const int last = instance.get_customers_end();
+        std::vector<std::size_t> offsets(static_cast<std::size_t>(last) + 1, 0);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(last - first >= 10000)
+#endif
+        for (int i = first; i < last; ++i) {
             const auto &ineighbors = instance.get_neighbors_of(i);
-            const unsigned int max_n = static_cast<unsigned int>(ineighbors.size());
-
-            for (auto n = 1u, added = 0u; added < static_cast<unsigned int>(neighbors_num) && n < max_n; n++) {
-                const auto j = ineighbors[n];
-
+            unsigned int added = 0;
+            for (std::size_t n = 1; added < static_cast<unsigned int>(neighbors_num) && n < ineighbors.size(); ++n) {
+                added += i < ineighbors[n];
+            }
+            offsets[i + 1] = added;
+        }
+        for (int i = first; i < last; ++i) {
+            offsets[i + 1] += offsets[i];
+        }
+        savings.resize(offsets[last]);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(last - first >= 10000)
+#endif
+        for (int i = first; i < last; ++i) {
+            const auto &ineighbors = instance.get_neighbors_of(i);
+            std::size_t position = offsets[i];
+            for (std::size_t n = 1; position < offsets[i + 1] && n < ineighbors.size(); ++n) {
+                const int j = ineighbors[n];
                 if (i < j) {
-                    const double value = cost_i_depot + depot_costs[j] - lambda * instance.get_cost(i, j);
-                    savings.push_back({i, j, value});
-                    added++;
+                    const double value = depot_costs[i] + depot_costs[j] - lambda * instance.get_cost(i, j);
+                    savings[position++] = {i, j, value};
                 }
             }
         }
 
-        std::sort(savings.begin(), savings.end(), [](const Saving &a, const Saving &b) { return a.value > b.value; });
+        // Keep the original FILO2 comparison and std::sort ordering. Tied
+        // savings can lead to different route merges if a parallel sort
+        // permutes them, even though their numeric values are equal.
+        std::sort(savings.begin(), savings.end(),
+                  [](const Saving &a, const Saving &b) { return a.value > b.value; });
 
 #ifdef VERBOSE
         Timer timer;
 #endif
 
-        for (auto n = 0; n < static_cast<int>(savings.size()); ++n) {
+        for (std::size_t n = 0; n < savings.size(); ++n) {
 
             const auto &saving = savings[n];
 

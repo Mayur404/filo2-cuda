@@ -611,8 +611,10 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
     int* d_scratch_ids = nullptr;
     double* d_scratch_distances = nullptr;
     int* pinned_batch_ids = nullptr;
+    int* pinned_next_batch_ids = nullptr;
     std::vector<int> fallback_batch_ids;
     auto release = [&]() {
+        if (pinned_next_batch_ids != nullptr) cudaFreeHost(pinned_next_batch_ids);
         if (pinned_batch_ids != nullptr) cudaFreeHost(pinned_batch_ids);
         if (d_scratch_distances != nullptr) cudaFree(d_scratch_distances);
         if (d_scratch_ids != nullptr) cudaFree(d_scratch_ids);
@@ -682,7 +684,31 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
             return make_result(CudaGridKnnStatus::Error, "host batch output allocation failed");
         }
     }
-    int* dest_batch = pinned_batch_ids != nullptr ? pinned_batch_ids : fallback_batch_ids.data();
+    // With two pinned buffers, the GPU can produce the next batch while the
+    // CPU scatters the completed batch into its final neighbor rows. A second
+    // allocation is optional: the existing synchronous path remains usable
+    // when pinned host memory is scarce.
+    if (pinned_batch_ids != nullptr && n > batch &&
+        cudaMallocHost(&pinned_next_batch_ids, max_batch_ids * sizeof(int)) != cudaSuccess) {
+        pinned_next_batch_ids = nullptr;
+    }
+    const bool pipelined = pinned_next_batch_ids != nullptr;
+    auto scatter_batch = [&](std::uint64_t query_offset, std::uint64_t query_count,
+                             const int* source_batch) {
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (std::int64_t local = 0; local < static_cast<std::int64_t>(query_count); ++local) {
+            const std::size_t query = static_cast<std::size_t>(query_offset) + static_cast<std::size_t>(local);
+            const int* source = source_batch +
+                                static_cast<std::size_t>(local) * static_cast<std::size_t>(effective_k);
+            std::copy_n(source, static_cast<std::size_t>(effective_k), out[query].data());
+        }
+    };
+    std::uint64_t previous_offset = 0;
+    std::uint64_t previous_count = 0;
+    const int* previous_batch = nullptr;
+    bool use_next_buffer = false;
 
     for (std::uint64_t query_offset = 0; query_offset < n; query_offset += batch) {
         const std::uint64_t query_count_u64 = std::min(batch, n - query_offset);
@@ -701,28 +727,42 @@ CudaGridKnnResult compute_cuda_grid_knn(const std::vector<double>& xs,
             release();
             return make_result(CudaGridKnnStatus::Error, cuda_error("grid_knn_kernel launch", error));
         }
-        // cudaMemcpy on the default stream waits for this kernel, so an
-        // explicit device-wide synchronize here only adds a second global
-        // barrier per batch. The copy below provides the required completion
-        // point while preserving the existing error path.
         const std::size_t copied_ids = static_cast<std::size_t>(query_count_u64) *
                                        static_cast<std::size_t>(effective_k);
-        error = cudaMemcpy(dest_batch, d_scratch_ids,
-                           copied_ids * sizeof(int), cudaMemcpyDeviceToHost);
+        int* dest_batch = pinned_batch_ids == nullptr ? fallback_batch_ids.data() :
+                          (use_next_buffer ? pinned_next_batch_ids : pinned_batch_ids);
+        if (pipelined) {
+            error = cudaMemcpyAsync(dest_batch, d_scratch_ids,
+                                    copied_ids * sizeof(int), cudaMemcpyDeviceToHost);
+        } else {
+            error = cudaMemcpy(dest_batch, d_scratch_ids,
+                               copied_ids * sizeof(int), cudaMemcpyDeviceToHost);
+        }
         if (error != cudaSuccess) {
             release();
             return make_result(CudaGridKnnStatus::Error, cuda_error("cudaMemcpy(batch IDs)", error));
         }
-#if defined(_OPENMP)
-        #pragma omp parallel for schedule(static)
-#endif
-        for (std::int64_t local = 0; local < static_cast<std::int64_t>(query_count); ++local) {
-            const std::size_t query = static_cast<std::size_t>(query_offset) + static_cast<std::size_t>(local);
-            const int* source = dest_batch +
-                                static_cast<std::size_t>(local) * static_cast<std::size_t>(effective_k);
-            std::copy_n(source, static_cast<std::size_t>(effective_k), out[query].data());
+        if (pipelined) {
+            // The previous transfer was synchronized at the end of the last
+            // iteration. Its host buffer is safe to read while this kernel
+            // and D2H transfer run in the default CUDA stream.
+            if (previous_batch != nullptr) {
+                scatter_batch(previous_offset, previous_count, previous_batch);
+            }
+            error = cudaStreamSynchronize(nullptr);
+            if (error != cudaSuccess) {
+                release();
+                return make_result(CudaGridKnnStatus::Error, cuda_error("cudaStreamSynchronize(batch)", error));
+            }
+            previous_offset = query_offset;
+            previous_count = query_count_u64;
+            previous_batch = dest_batch;
+            use_next_buffer = !use_next_buffer;
+        } else {
+            scatter_batch(query_offset, query_count_u64, dest_batch);
         }
     }
+    if (pipelined) scatter_batch(previous_offset, previous_count, previous_batch);
     release();
     std::ostringstream message;
     message << "CUDA grid k-NN succeeded (N=" << n << ", k=" << effective_k

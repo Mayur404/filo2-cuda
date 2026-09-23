@@ -148,6 +148,17 @@ add_executable(filo2
     ${FILO2_CUDA_SOURCES}
 )
 
+find_package(OpenMP COMPONENTS CXX)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(filo2 PRIVATE OpenMP::OpenMP_CXX)
+    if(FILO2_USE_CUDA AND MSVC)
+        # nvcc compiles the host half of .cu files separately from C++ files.
+        # Pass OpenMP to that host compiler as well, so the batch scatter and
+        # output-row initialization in CudaGridKnn.cu use the available cores.
+        target_compile_options(filo2 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/openmp>)
+    endif()
+endif()
+
 target_link_libraries(filo2 PUBLIC ${LIBRARIES})
 
 if(FILO2_USE_CUDA)
